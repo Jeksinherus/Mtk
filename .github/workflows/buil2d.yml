@@ -1,0 +1,411 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Create Android project
+        shell: bash
+        run: |
+          mkdir -p android-app/app/src/main/java/com/mtksoft/cihazsorgu
+          mkdir -p android-app/app/src/main/res/values
+          mkdir -p android-app/app/src/main/res/xml
+
+          cat > android-app/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "MTKSOFT Cihaz Sorgu"
+          include ":app"
+          EOF
+
+          cat > android-app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.5.2" apply false
+          }
+          EOF
+
+          cat > android-app/app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+          }
+
+          android {
+              namespace "com.mtksoft.cihazsorgu"
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.mtksoft.cihazsorgu"
+                  minSdk 24
+                  targetSdk 35
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+
+          dependencies {
+              implementation "com.journeyapps:zxing-android-embedded:4.3.0"
+              implementation "com.google.zxing:core:3.5.3"
+          }
+          EOF
+
+          cat > android-app/app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowLightStatusBar">true</item>
+                  <item name="android:statusBarColor">#ffffff</item>
+                  <item name="android:navigationBarColor">#ffffff</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > android-app/app/src/main/res/xml/network_security_config.xml <<'EOF'
+          <network-security-config>
+              <base-config cleartextTrafficPermitted="true" />
+          </network-security-config>
+          EOF
+
+          cat > android-app/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CAMERA" />
+
+              <application
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/AppTheme"
+                  android:label="MTKSOFT Cihaz Sorgu"
+                  android:networkSecurityConfig="@xml/network_security_config">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > android-app/app/src/main/java/com/mtksoft/cihazsorgu/MainActivity.java <<'EOF'
+          package com.mtksoft.cihazsorgu;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.net.ConnectivityManager;
+          import android.net.NetworkInfo;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.webkit.PermissionRequest;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          import com.google.zxing.integration.android.IntentIntegrator;
+          import com.google.zxing.integration.android.IntentResult;
+
+          public class MainActivity extends Activity {
+              private static final String DEFAULT_URL = "http://192.168.87.55:8787/";
+              private static final String PREFS = "mtksoft_prefs";
+              private static final String KEY_URL = "server_url";
+              private static final int CAMERA_REQUEST = 5001;
+
+              private WebView webView;
+              private LinearLayout errorView;
+              private SharedPreferences prefs;
+              private PermissionRequest pendingPermissionRequest;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_REQUEST);
+                  }
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.WHITE);
+
+                  LinearLayout toolbar = new LinearLayout(this);
+                  toolbar.setOrientation(LinearLayout.HORIZONTAL);
+                  toolbar.setGravity(Gravity.CENTER_VERTICAL);
+                  int densityTop = (int) (32 * getResources().getDisplayMetrics().density);
+                  int densitySide = (int) (10 * getResources().getDisplayMetrics().density);
+                  int densityBottom = (int) (8 * getResources().getDisplayMetrics().density);
+                  int buttonHeight = (int) (44 * getResources().getDisplayMetrics().density);
+                  toolbar.setPadding(densitySide, densityTop, densitySide, densityBottom);
+                  toolbar.setBackgroundColor(Color.WHITE);
+
+                  TextView title = new TextView(this);
+                  title.setText("MTKSOFT Cihaz Sorgu");
+                  title.setTextSize(16);
+                  title.setTextColor(Color.rgb(31, 41, 51));
+                  toolbar.addView(title, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+
+                  Button scanButton = new Button(this);
+                  scanButton.setText("Barkod");
+                  scanButton.setMinHeight(buttonHeight);
+                  toolbar.addView(scanButton);
+
+                  Button refreshButton = new Button(this);
+                  refreshButton.setText("Yenile");
+                  refreshButton.setMinHeight(buttonHeight);
+                  toolbar.addView(refreshButton);
+
+                  Button settingsButton = new Button(this);
+                  settingsButton.setText("Ayar");
+                  settingsButton.setMinHeight(buttonHeight);
+                  toolbar.addView(settingsButton);
+
+                  webView = new WebView(this);
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setLoadWithOverviewMode(true);
+                  settings.setUseWideViewPort(true);
+                  settings.setMediaPlaybackRequiresUserGesture(false);
+                  settings.setUserAgentString(settings.getUserAgentString() + " MTKSOFT-CihazSorgu-App");
+
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onPermissionRequest(final PermissionRequest request) {
+                          runOnUiThread(() -> {
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                                  pendingPermissionRequest = request;
+                                  requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_REQUEST);
+                              } else {
+                                  request.grant(request.getResources());
+                              }
+                          });
+                      }
+                  });
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          showWeb();
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                          if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || request.isForMainFrame()) {
+                              showError();
+                          }
+                      }
+                  });
+
+                  errorView = buildErrorView();
+
+                  root.addView(toolbar);
+                  root.addView(webView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+                  root.addView(errorView, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1));
+                  setContentView(root);
+
+                  scanButton.setOnClickListener(v -> startNativeBarcodeScan());
+                  refreshButton.setOnClickListener(v -> loadServer());
+                  settingsButton.setOnClickListener(v -> showSettingsDialog());
+                  loadServer();
+              }
+
+              private LinearLayout buildErrorView() {
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setGravity(Gravity.CENTER);
+                  layout.setPadding(24, 24, 24, 24);
+                  layout.setVisibility(View.GONE);
+
+                  TextView message = new TextView(this);
+                  message.setText("Sunucuya baglanilamadi.\n\nPC'de baslat-telefon.bat calisiyor olmali.\nTelefon ve PC ayni Wi-Fi aginda olmali.\nAdres: " + getServerUrl());
+                  message.setTextSize(15);
+                  message.setTextColor(Color.rgb(31, 41, 51));
+                  message.setGravity(Gravity.CENTER);
+                  layout.addView(message);
+
+                  Button retry = new Button(this);
+                  retry.setText("Tekrar Dene");
+                  retry.setOnClickListener(v -> loadServer());
+                  layout.addView(retry);
+
+                  Button settings = new Button(this);
+                  settings.setText("Sunucu Adresini Degistir");
+                  settings.setOnClickListener(v -> showSettingsDialog());
+                  layout.addView(settings);
+                  return layout;
+              }
+
+              private void startNativeBarcodeScan() {
+                  IntentIntegrator integrator = new IntentIntegrator(this);
+                  integrator.setPrompt("Ustteki TRY/VTN barkodunu okutun");
+                  integrator.setBeepEnabled(true);
+                  integrator.setOrientationLocked(false);
+                  integrator.setDesiredBarcodeFormats(IntentIntegrator.ALL_CODE_TYPES);
+                  integrator.initiateScan();
+              }
+
+              private void injectBarcode(String value) {
+                  if (value == null) return;
+                  String escaped = value.replace("\\", "\\\\").replace("'", "\\'");
+                  String js = "var q=document.getElementById('q');"
+                          + "if(q){q.value='" + escaped + "';"
+                          + "var f=document.getElementById('searchForm');"
+                          + "if(f){f.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));}}";
+                  webView.evaluateJavascript(js, null);
+              }
+
+              private void loadServer() {
+                  if (!hasNetwork()) {
+                      showError();
+                      return;
+                  }
+                  showWeb();
+                  webView.loadUrl(getServerUrl());
+              }
+
+              private String getServerUrl() {
+                  String url = prefs.getString(KEY_URL, DEFAULT_URL);
+                  if (url == null || url.trim().isEmpty()) return DEFAULT_URL;
+                  url = url.trim();
+                  if (!url.endsWith("/")) url += "/";
+                  return url;
+              }
+
+              private boolean hasNetwork() {
+                  ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                  NetworkInfo info = cm == null ? null : cm.getActiveNetworkInfo();
+                  return info != null && info.isConnected();
+              }
+
+              private void showWeb() {
+                  webView.setVisibility(View.VISIBLE);
+                  errorView.setVisibility(View.GONE);
+              }
+
+              private void showError() {
+                  webView.setVisibility(View.GONE);
+                  errorView.setVisibility(View.VISIBLE);
+              }
+
+              private void showSettingsDialog() {
+                  final EditText input = new EditText(this);
+                  input.setSingleLine(true);
+                  input.setText(getServerUrl());
+                  input.setSelectAllOnFocus(true);
+
+                  new AlertDialog.Builder(this)
+                          .setTitle("Sunucu Adresi")
+                          .setMessage("PC IP adresi degisirse burayi guncelle.")
+                          .setView(input)
+                          .setPositiveButton("Kaydet", (dialog, which) -> {
+                              prefs.edit().putString(KEY_URL, input.getText().toString().trim()).apply();
+                              loadServer();
+                          })
+                          .setNegativeButton("Vazgec", null)
+                          .show();
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  IntentResult result = IntentIntegrator.parseActivityResult(requestCode, resultCode, data);
+                  if (result != null) {
+                      if (result.getContents() != null) {
+                          injectBarcode(result.getContents());
+                      }
+                      return;
+                  }
+                  super.onActivityResult(requestCode, resultCode, data);
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == CAMERA_REQUEST && pendingPermissionRequest != null) {
+                      if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                          pendingPermissionRequest.grant(pendingPermissionRequest.getResources());
+                      } else {
+                          pendingPermissionRequest.deny();
+                      }
+                      pendingPermissionRequest = null;
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+      - name: Build debug APK
+        working-directory: android-app
+        run: gradle :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MTKSOFT-Cihaz-Sorgu-debug-apk
+          path: android-app/app/build/outputs/apk/debug/app-debug.apk
